@@ -20,16 +20,17 @@ class GuiIntegrationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         try:
-            cls.root = tk.Tk()
-            cls.root.withdraw()
+            probe = tk.Tk()
+            probe.withdraw()
+            probe.destroy()
         except tk.TclError as exc:
             raise unittest.SkipTest(f"Tk display/runtime unavailable: {exc}")
 
-    @classmethod
-    def tearDownClass(cls):
-        cls.root.destroy()
-
     def setUp(self):
+        # Use a fresh window: a mapped layout test can leave realized geometry
+        # cached on a withdrawn shared root, hiding later geometry requests.
+        self.root = tk.Tk()
+        self.root.withdraw()
         self.callback_errors = []
         self.root.report_callback_exception = lambda *args: self.callback_errors.append(args)
         self.error_patch = patch("src.gui.messagebox.showerror")
@@ -47,6 +48,7 @@ class GuiIntegrationTests(unittest.TestCase):
         # Finalize Tk variables on the UI thread before another CSV worker.
         gc.collect()
         self.root.update_idletasks()
+        self.root.destroy()
         self.assertEqual(self.callback_errors, [], "Tk callback raised an exception")
 
     def wait_until(self, predicate, timeout=8):
