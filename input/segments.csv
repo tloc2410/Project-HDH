@@ -1,0 +1,4 @@
+segment_id,base,limit,permissions
+0,1000,400,rx
+1,2000,300,rw
+2,3000,500,rw
