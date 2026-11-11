@@ -1,6 +1,6 @@
 # Project-HDH — Trực quan hóa Segmentation
 
-Ứng dụng desktop **Python + Tkinter** minh họa cách dịch địa chỉ logic `(segment_id, offset)` thành địa chỉ vật lý, kiểm tra giới hạn và quyền `r/w/x`. Phần trực quan hóa chạy độc lập ngay trong repository này, dùng thư viện chuẩn Python.
+Ứng dụng desktop minh họa cách dịch địa chỉ logic `(segment_id, offset)` thành địa chỉ vật lý, kiểm tra giới hạn và quyền `r/w/x`. Giao diện mặc định dùng **Tkinter**. Dự án cũng có giao diện **PySide6** dùng chung bộ mô phỏng.
 
 ## Chạy chương trình
 
@@ -11,6 +11,17 @@ python run.py
 ```
 
 Trên Windows có thể nhấp đúp **`Start-Windows.cmd`**. Nếu máy dùng Python Launcher, chạy `py -3 run.py`. Kiểm tra Tkinter bằng `python -m tkinter`; không cần cài gói `tkinter` qua pip.
+
+### Giao diện PySide6
+
+Mở terminal ở thư mục `Project-HDH`. Cài thư viện giao diện rồi chạy:
+
+```powershell
+python -m pip install -r requirements-qt.txt
+python -m src.gui_qt
+```
+
+Giao diện PySide6 dùng chung bộ dịch địa chỉ và bộ đọc/xuất CSV của dự án. Trang chủ hiển thị bảng phân đoạn, kết quả dịch từng bước và sơ đồ bộ nhớ. Trang **Lịch sử** lưu kết quả dịch trong phiên làm việc. Trang **Nhập / Xuất CSV** cho phép nạp bảng phân đoạn, dịch danh sách địa chỉ và xuất kết quả dịch hàng loạt.
 
 ## Nội dung trực quan hóa
 
@@ -63,7 +74,7 @@ segment_id,offset,access
 python -m unittest discover -s tests -v
 ```
 
-Kiểm thử bao gồm lõi dịch địa chỉ, đọc/xuất CSV, kết quả mẫu và phần trực quan hóa. Kiểm thử GUI cần Tkinter và màn hình khả dụng; môi trường không có màn hình có thể bỏ qua nhóm GUI. GitHub Actions chạy trên Windows với Python 3.10 và 3.14, kiểm tra Tk trước khi chạy toàn bộ bộ test.
+Kiểm thử bao gồm lõi dịch địa chỉ, đọc/xuất CSV, kết quả mẫu và phần trực quan hóa. Kiểm thử Tkinter cần màn hình khả dụng. Cài `requirements-qt.txt` để lệnh trên chạy thêm kiểm thử thao tác trên giao diện PySide6. GitHub Actions chạy trên Windows với Python 3.10 và 3.14, kiểm tra Tk trước khi chạy kiểm thử.
 
 ## Cấu trúc
 
@@ -73,6 +84,8 @@ Start-Windows.cmd          Mở ứng dụng trên Windows
 src/segmentation.py        Thuật toán và các bước dịch có cấu trúc
 src/visualization.py       Thành phần trực quan hóa
 src/gui.py                 Giao diện Tkinter
+src/gui_qt/                Giao diện PySide6 và kết nối với bộ mô phỏng
+requirements-qt.txt        Thư viện dùng để chạy giao diện PySide6
 src/csv_io.py              Kiểm tra, đọc và xuất CSV
 input/                     Bảng segment, địa chỉ và kết quả kỳ vọng
 tests/                     Kiểm thử tự động
