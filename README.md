@@ -10,7 +10,7 @@ Cài **Python 3.10 trở lên**, gồm thành phần **Tcl/Tk**. Mở terminal t
 python run.py
 ```
 
-Trên Windows có thể nhấp đúp **`Start-Windows.cmd`**. Nếu máy dùng Python Launcher, chạy `py -3 run.py`. Kiểm tra Tkinter bằng `python -m tkinter`; không cần cài gói `tkinter` qua pip.
+Trên Windows có thể nhấp đúp **`Start-Windows.cmd`**. Trên macOS có thể nhấp đúp **`Start-macOS.command`**. Nếu máy dùng Python Launcher, chạy `py -3 run.py`. Kiểm tra Tkinter bằng `python -m tkinter`; không cần cài gói `tkinter` qua pip.
 
 ### Giao diện PySide6
 
