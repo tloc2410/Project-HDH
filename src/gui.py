@@ -1,745 +1,731 @@
-"""Vietnamese Tkinter front end for the segmentation simulator.
-
-This module and visualization.py use Tk. Batch address CSV parsing,
-translation and result export run outside the UI thread; widgets are
-updated on the main thread.
-"""
-from __future__ import annotations
-
+import sys
+from datetime import datetime
 from pathlib import Path
-import queue
-import threading
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
-from typing import Callable
 
+from PySide6.QtCore import Qt, QRectF
+from PySide6.QtGui import QColor, QFont, QPainter, QPen
+from PySide6.QtWidgets import (
+    QApplication, QAbstractItemView, QComboBox, QDialog, QDialogButtonBox,
+    QFileDialog, QFormLayout, QFrame, QGridLayout, QHeaderView, QHBoxLayout,
+    QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton, QScrollArea,
+    QStackedWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget
+)
+
+from .segmentation import LogicalAddress, Segment, SegmentTable
 from .csv_io import load_addresses, load_segments, save_results
-from .segmentation import LogicalAddress, Segment, SegmentTable, TranslationResult
-from .visualization import MemoryCanvas, PipelineCanvas, Playback, compact
+from .visualization import Playback, PALETTE, STAGES, compact
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DISPLAY_LIMIT = 1000
-COLORS = {
-    "background": "#edf2f7", "surface": "#ffffff", "navy": "#152b45",
-    "text": "#233a50", "muted": "#627589", "teal": "#087f83",
-    "light_teal": "#e2f4f1", "red": "#b53443", "light_red": "#fcebee",
-    "border": "#dae3ec", "blue": "#467bb5",
-}
-ACCESS_NAMES = {"Đọc (r)": "r", "Ghi (w)": "w", "Thực thi (x)": "x"}
-STATUS_NAMES = {
-    "OK": "Hợp lệ", "SEGMENT_NOT_FOUND": "Không có segment",
-    "SEGMENTATION_FAULT": "Vượt giới hạn", "PROTECTION_FAULT": "Không đủ quyền",
-}
+STYLE = '''
+QWidget {font-family: 'Segoe UI', Arial; font-size: 12px; color: #142b50;}
+QWidget#root {background: #f1f5fb;}
+QFrame#sidebar {background: #172f54; border: none;}
+QLabel#brand {color: white; font-size: 17px; font-weight: 800;}
+QLabel#sideInfo {color: #c3d6f3; font-size: 11px;}
+QPushButton#nav {text-align: left; background: transparent; color: #d9e7ff; border: none; padding: 12px 14px; border-radius: 8px; font-weight: 600;}
+QPushButton#nav:hover {background: #284873;}
+QPushButton#nav[active="true"] {background: #2c74f4; color: white;}
+QLabel#title {font-size: 23px; font-weight: 800; color: #142b50;}
+QLabel#muted {color: #7385a4; font-size: 11px;}
+QLabel#section {font-size: 15px; font-weight: 750;}
+QFrame#card {background: white; border: 1px solid #dfe8f5; border-radius: 13px;}
+QPushButton {background: white; border: 1px solid #cbd9ef; padding: 9px 12px; border-radius: 7px; font-weight: 600;}
+QPushButton:hover {background: #eaf2ff;}
+QPushButton#primary {background: #2b73f4; color: white; border-color: #2b73f4;}
+QPushButton#primary:hover {background: #155ddd;}
+QPushButton#secondary {background: #edf4ff; color: #245fc2; border-color: #d9e6fa;}
+QPushButton#danger {background: #fff0f2; color: #bb3543; border-color: #f4cbd0;}
+QLineEdit, QComboBox {background: white; border: 1px solid #ccd9eb; border-radius: 6px; padding: 8px; min-height: 20px;}
+QTableWidget {background: white; border: 1px solid #e0e9f6; gridline-color: #e5ecf6; selection-background-color: #d8e8ff; alternate-background-color: #f8faff;}
+QHeaderView::section {background: #f0f5fc; border: none; border-bottom: 1px solid #e1e9f4; padding: 9px; font-weight: bold;}
+QLabel#infoBox {background: #edf4ff; color: #5373a3; border-radius: 8px; padding: 13px;}
+QFrame#placeholder {background: #f1f5fb; border: 1px dashed #d4e2f5; border-radius: 8px;}
+'''
 
 
-def short_number(value: int | None, max_length: int = 22) -> str:
-    """Keep huge integer labels inside the layout; exact values remain in CSV."""
-    if value is None:
-        return "—"
-    raw = str(value)
-    if len(raw) <= max_length:
-        return raw
-    return f"{raw[:10]}…{raw[-6:]} ({len(raw.lstrip('-'))} chữ số)"
+def button(label, callback, role='secondary'):
+    widget = QPushButton(label)
+    widget.setObjectName(role)
+    widget.clicked.connect(callback)
+    return widget
 
 
-class SegmentationApp(ttk.Frame):
-    """Desktop application; constructing it never starts mainloop."""
+def card(title):
+    frame = QFrame()
+    frame.setObjectName('card')
+    layout = QVBoxLayout(frame)
+    layout.setContentsMargins(16, 15, 16, 15)
+    layout.setSpacing(11)
+    heading = QLabel(title)
+    heading.setObjectName('section')
+    layout.addWidget(heading)
+    return frame, layout
 
-    def __init__(self, master: tk.Tk):
-        super().__init__(master, style="App.TFrame")
-        self.master = master
-        self.table = SegmentTable([Segment(0, 1000, 400, "rx"),
-                                   Segment(1, 2000, 300, "rw"),
-                                   Segment(2, 3000, 500, "rw")])
-        self.single_result: TranslationResult | None = None
-        self.batch_table = self.table
-        self.batch_results: list[TranslationResult] = []
-        self.trace_steps: tuple[str, ...] = ()
-        self.trace_visible = 0
+
+def data_table(headers):
+    widget = QTableWidget(0, len(headers))
+    widget.setHorizontalHeaderLabels(headers)
+    widget.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+    widget.verticalHeader().hide()
+    widget.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+    widget.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+    widget.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+    widget.setAlternatingRowColors(True)
+    return widget
+
+
+def display_permissions(value):
+    return ''.join(char if char in value else '-' for char in 'rwx')
+
+
+class SegmentDialog(QDialog):
+    def __init__(self, parent=None, segment=None):
+        super().__init__(parent)
+        self.setWindowTitle('Sửa phân đoạn' if segment else 'Thêm phân đoạn')
+        self.setMinimumWidth(370)
+        root = QVBoxLayout(self)
+        form = QFormLayout()
+        self.segment_id = QLineEdit()
+        self.base = QLineEdit()
+        self.limit = QLineEdit()
+        self.permission = QComboBox()
+        for text, code in (
+            ('r--', 'r'), ('rw-', 'rw'), ('r-x', 'rx'), ('rwx', 'rwx'),
+            ('-w-', 'w'), ('--x', 'x'), ('-wx', 'wx')
+        ):
+            self.permission.addItem(text, code)
+        if segment is not None:
+            self.segment_id.setText(str(segment.segment_id))
+            self.segment_id.setReadOnly(True)
+            self.base.setText(str(segment.base))
+            self.limit.setText(str(segment.limit))
+            self.permission.setCurrentText(display_permissions(segment.permissions))
+        form.addRow('Segment ID:', self.segment_id)
+        form.addRow('Base:', self.base)
+        form.addRow('Limit:', self.limit)
+        form.addRow('Quyền:', self.permission)
+        root.addLayout(form)
+        controls = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        controls.button(QDialogButtonBox.StandardButton.Save).setText('Lưu')
+        controls.button(QDialogButtonBox.StandardButton.Cancel).setText('Hủy')
+        controls.accepted.connect(self.accept)
+        controls.rejected.connect(self.reject)
+        root.addWidget(controls)
+
+    def get_segment(self):
+        return Segment(
+            segment_id=int(self.segment_id.text().strip()),
+            base=int(self.base.text().strip()),
+            limit=int(self.limit.text().strip()),
+            permissions=self.permission.currentData()
+        )
+
+
+class PipelineWidget(QWidget):
+    def __init__(self):
+        super().__init__()
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        self.labels = []
+        for index, (_, title) in enumerate(STAGES):
+            label = QLabel(f'{index + 1}. {title}\nChưa chạy')
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            label.setWordWrap(True)
+            label.setMinimumHeight(62)
+            layout.addWidget(label, 1)
+            self.labels.append(label)
+        self.set_playback(Playback())
+
+    def set_playback(self, playback):
+        states = {'pass': 'Đạt', 'error': 'Lỗi · dừng', 'waiting': 'Chưa chạy', 'skipped': 'Bỏ qua'}
+        for index, (label, stage) in enumerate(zip(self.labels, playback.stages())):
+            label.setText(f'{index + 1}. {stage.title}\n{states[stage.state]}')
+            background = PALETTE[stage.state + '_bg']
+            foreground = PALETTE[stage.state]
+            label.setStyleSheet(
+                f'background:{background};color:{foreground};border:1px solid {foreground};'
+                'border-radius:7px;padding:5px;font-size:10px;font-weight:600;'
+            )
+
+
+class MemoryMapWidget(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.table = None
         self.playback = Playback()
-        self._play_after: str | None = None
-        self._map_table = self.table
-        self._map_result: TranslationResult | None = None
-        self._map_after: str | None = None
-        self._job_after: str | None = None
-        self._job_queue: queue.Queue = queue.Queue()
-        self._job_callback: Callable | None = None
-        self._job_running = False
-        self._configure_style()
-        master.title("Project-HDH · Trực quan hóa Segmentation")
-        # Tk reports logical pixels on Windows with display scaling enabled.
-        # Reserve room for the title bar and taskbar instead of assuming a
-        # 1080-pixel physical display can accommodate an 850-pixel Tk window.
-        width = min(1180, max(640, master.winfo_screenwidth() - 80))
-        height = min(760, max(480, master.winfo_screenheight() - 140))
-        master.geometry(f"{width}x{height}+24+24")
-        master.minsize(min(1000, width), min(700, height))
-        master.configure(background=COLORS["background"])
-        self.pack(fill="both", expand=True)
-        self._build_header()
-        self.notebook = ttk.Notebook(self)
-        self.notebook.pack(fill="both", expand=True, padx=16, pady=(10, 8))
-        self.simulator_tab = ttk.Frame(self.notebook, padding=10, style="App.TFrame")
-        self.editor_tab = ttk.Frame(self.notebook, padding=10, style="App.TFrame")
-        self.batch_tab = ttk.Frame(self.notebook, padding=10, style="App.TFrame")
-        self.help_tab = ttk.Frame(self.notebook, padding=10, style="App.TFrame")
-        self.notebook.add(self.simulator_tab, text="  01  Dịch địa chỉ  ")
-        self.notebook.add(self.editor_tab, text="  02  Sửa bảng segment  ")
-        self.notebook.add(self.batch_tab, text="  03  Xử lý CSV  ")
-        self.notebook.add(self.help_tab, text="  04  Hướng dẫn  ")
-        self._build_simulator()
-        self._build_batch()
-        self._build_help()
-        self.status_var = tk.StringVar(value="Sẵn sàng. Dữ liệu mẫu đã được nạp.")
-        self.status_label = ttk.Label(self, textvariable=self.status_var, style="Foot.TLabel")
-        self.status_label.pack(side="bottom", fill="x", padx=24, pady=(0, 12), before=self.notebook)
-        self.load_sample()
+        self.setMinimumHeight(230)
 
-    def destroy(self) -> None:
-        """Cancel pending Tk callbacks when the window or a test closes."""
-        for callback in (self._map_after, self._job_after, self._play_after):
-            if callback is not None:
-                self.after_cancel(callback)
-        self._map_after = self._job_after = self._play_after = None
-        super().destroy()
-
-    def _configure_style(self) -> None:
-        style = ttk.Style(self.master)
-        style.theme_use("clam")
-        style.configure(".", font=("Segoe UI", 10), background=COLORS["surface"],
-                        foreground=COLORS["text"])
-        style.configure("App.TFrame", background=COLORS["background"])
-        style.configure("Card.TFrame", background=COLORS["surface"])
-        style.configure("Title.TLabel", font=("Segoe UI", 13, "bold"))
-        style.configure("Sub.TLabel", foreground=COLORS["muted"], font=("Segoe UI", 9))
-        style.configure("Foot.TLabel", background=COLORS["background"],
-                        foreground=COLORS["muted"], font=("Segoe UI", 9))
-        style.configure("TNotebook", background=COLORS["background"], borderwidth=0)
-        style.configure("TNotebook.Tab", padding=(12, 9), background="#dfe8f0")
-        style.map("TNotebook.Tab", background=[("selected", COLORS["surface"])],
-                  foreground=[("selected", COLORS["teal"])])
-        style.configure("TButton", padding=(10, 7), borderwidth=1)
-        style.configure("Accent.TButton", background=COLORS["teal"], foreground="white")
-        style.map("Accent.TButton", background=[("active", "#096b70"),
-                  ("disabled", "#95b5b6")], foreground=[("disabled", "#f4f7f8")])
-        style.configure("Treeview", rowheight=27, fieldbackground=COLORS["surface"],
-                        borderwidth=0, font=("Segoe UI", 10))
-        style.configure("Treeview.Heading", background="#eaf0f5", padding=(6, 8),
-                        font=("Segoe UI", 9, "bold"))
-        style.map("Treeview", background=[("selected", "#d0e9ef")],
-                  foreground=[("selected", COLORS["navy"])])
-        style.configure("TEntry", padding=5)
-        style.configure("TCombobox", padding=5)
-
-    def _build_header(self) -> None:
-        header = tk.Frame(self, background=COLORS["navy"], padx=24, pady=10)
-        header.pack(fill="x")
-        tk.Label(header, text="Trực quan hóa phân đoạn bộ nhớ",
-                 font=("Segoe UI", 19, "bold"), foreground="white",
-                 background=COLORS["navy"]).pack(anchor="w", pady=(3, 4))
-        tk.Label(header, text="Project-HDH   /   Tra segment → Giới hạn → Quyền r/w/x → Địa chỉ vật lý",
-                 font=("Segoe UI", 10), foreground="#bed1e3",
-                 background=COLORS["navy"]).pack(anchor="w")
-
-    @staticmethod
-    def _card(parent, title: str, subtitle: str) -> ttk.Frame:
-        frame = ttk.Frame(parent, padding=10, style="Card.TFrame")
-        ttk.Label(frame, text=title, style="Title.TLabel").pack(anchor="w")
-        ttk.Label(frame, text=subtitle, style="Sub.TLabel", wraplength=520).pack(
-            anchor="w", pady=(3, 10))
-        return frame
-
-    @staticmethod
-    def _tree(parent, columns: tuple, headings: tuple, widths: tuple, height: int):
-        frame = ttk.Frame(parent)
-        frame.pack(fill="both", expand=True)
-        tree = ttk.Treeview(frame, columns=columns, show="headings", height=height,
-                            selectmode="browse")
-        for column, label, width in zip(columns, headings, widths):
-            tree.heading(column, text=label)
-            tree.column(column, width=width, minwidth=55, anchor="center")
-        vertical = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
-        horizontal = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
-        tree.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
-        tree.grid(row=0, column=0, sticky="nsew")
-        vertical.grid(row=0, column=1, sticky="ns")
-        horizontal.grid(row=1, column=0, sticky="ew")
-        frame.rowconfigure(0, weight=1)
-        frame.columnconfigure(0, weight=1)
-        return tree
-
-    def _build_simulator(self) -> None:
-        area = self.simulator_tab
-        area.columnconfigure(0, weight=4, uniform="split")
-        area.columnconfigure(1, weight=5, uniform="split")
-        area.rowconfigure(0, weight=1)
-        left = ttk.Frame(area, style="App.TFrame")
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
-        right = ttk.Frame(area, style="App.TFrame")
-        right.grid(row=0, column=1, sticky="nsew")
-        segments = self._card(left, "Bảng segment", "Limit là độ dài. Offset hợp lệ: 0 ≤ offset < limit.")
-        segments.pack(fill="both", expand=True)
-        toolbar = ttk.Frame(segments)
-        toolbar.pack(fill="x", pady=(0, 8))
-        self.sample_button = ttk.Button(toolbar, text="Nạp mẫu", command=self.load_sample)
-        self.sample_button.pack(side="left")
-        self.load_segments_button = ttk.Button(toolbar, text="Mở segments.csv", command=self.open_segments)
-        self.load_segments_button.pack(side="left", padx=6)
-        self.segment_count_var = tk.StringVar()
-        ttk.Label(toolbar, textvariable=self.segment_count_var, style="Sub.TLabel").pack(side="right")
-        self.segment_tree = self._tree(segments, ("id", "base", "limit", "rights"),
-            ("Segment", "Base", "Limit", "Quyền"), (75, 105, 95, 55), 3)
-        self.segment_tree.bind("<<TreeviewSelect>>", self._select_segment)
-        editor = self._card(self.editor_tab, "Chỉnh sửa bảng segment",
-            "Chọn dòng ở tab Dịch địa chỉ để nạp thông số. ID đã có sẽ được cập nhật; ID mới được thêm.")
-        editor.pack(fill="x")
-        form = ttk.Frame(editor)
-        form.pack(fill="x", pady=(8, 0))
-        self.segment_id_var = tk.StringVar(value="3")
-        self.base_var = tk.StringVar(value="4000")
-        self.limit_var = tk.StringVar(value="200")
-        self.permissions_var = tk.StringVar(value="rw")
-        fields = (("ID", self.segment_id_var), ("Base", self.base_var),
-                  ("Limit", self.limit_var), ("Quyền", self.permissions_var))
-        for column, (label, variable) in enumerate(fields):
-            form.columnconfigure(column, weight=1)
-            ttk.Label(form, text=label, style="Sub.TLabel").grid(row=0, column=column, sticky="w")
-            widget = (ttk.Combobox(form, textvariable=variable, values=("r", "rw", "rx", "rwx", "w", "wx", "x"),
-                                  state="readonly", width=5) if column == 3 else
-                      ttk.Entry(form, textvariable=variable, width=8))
-            widget.grid(row=1, column=column, sticky="ew", padx=(0, 5))
-        actions = ttk.Frame(editor)
-        actions.pack(fill="x", pady=(8, 0))
-        self.add_button = ttk.Button(actions, text="Thêm / cập nhật", command=self.upsert_segment)
-        self.add_button.pack(side="left")
-        self.remove_button = ttk.Button(actions, text="Xóa segment chọn", command=self.remove_segment)
-        self.remove_button.pack(side="left", padx=6)
-        ttk.Label(editor, text="Bảng mới được áp dụng cho các lần dịch tiếp theo. Kết quả CSV cũ giữ bảng đã chụp.",
-                  style="Sub.TLabel", wraplength=900).pack(anchor="w", pady=(12, 0))
-
-        address = self._card(left, "Địa chỉ logic", "Chọn segment, độ lệch và thao tác truy cập.")
-        address.pack(side="bottom", fill="x", pady=(12, 0), before=segments)
-        addr_form = ttk.Frame(address)
-        addr_form.pack(fill="x")
-        self.address_segment_var = tk.StringVar(value="0")
-        self.offset_var = tk.StringVar(value="120")
-        self.access_var = tk.StringVar(value="Đọc (r)")
-        for column, (label, variable) in enumerate((("Segment ID", self.address_segment_var),
-                ("Offset", self.offset_var), ("Thao tác", self.access_var))):
-            addr_form.columnconfigure(column, weight=1)
-            ttk.Label(addr_form, text=label, style="Sub.TLabel").grid(row=0, column=column, sticky="w")
-            widget = (ttk.Combobox(addr_form, textvariable=variable, values=tuple(ACCESS_NAMES),
-                                  state="readonly", width=13) if column == 2 else
-                      ttk.Entry(addr_form, textvariable=variable, width=9))
-            widget.grid(row=1, column=column, sticky="ew", padx=(0, 6))
-            if column != 2:
-                widget.bind("<Return>", lambda event: self.translate_single())
-        buttons = ttk.Frame(address)
-        buttons.pack(fill="x", pady=(10, 0))
-        self.translate_button = ttk.Button(buttons, text="Dịch địa chỉ", style="Accent.TButton",
-                                           command=self.translate_single)
-        self.translate_button.pack(side="left")
-        self.step_button = ttk.Button(buttons, text="Từng bước", command=lambda: self.translate_single(step=True))
-        self.step_button.pack(side="left", padx=6)
-        self.play_button = ttk.Button(buttons, text="▶ Tự chạy", command=self.toggle_play)
-        self.play_button.pack(side="left")
-        self.speed_var = tk.StringVar(value="1 giây")
-        ttk.Combobox(buttons, textvariable=self.speed_var,
-                     values=("0,5 giây", "1 giây", "2 giây"), state="readonly", width=7).pack(side="left", padx=(6, 0))
-
-        demo = ttk.Frame(address)
-        demo.pack(fill="x", pady=(10, 0))
-        self.scenarios = {
-            "Hợp lệ · đọc": (0, 120, "Đọc (r)"),
-            "Hợp lệ · ghi": (1, 50, "Ghi (w)"),
-            "Hợp lệ · thực thi": (0, 0, "Thực thi (x)"),
-            "Biên cuối · limit − 1": (0, 399, "Đọc (r)"),
-            "Lỗi · offset = limit": (0, 400, "Đọc (r)"),
-            "Lỗi · offset âm": (0, -1, "Đọc (r)"),
-            "Lỗi · quyền ghi": (0, 100, "Ghi (w)"),
-            "Lỗi · quyền thực thi": (1, 20, "Thực thi (x)"),
-            "Lỗi · thiếu segment": (9, 10, "Đọc (r)"),
-        }
-        self.scenario_var = tk.StringVar(value=next(iter(self.scenarios)))
-        ttk.Combobox(demo, textvariable=self.scenario_var, values=tuple(self.scenarios),
-                     state="readonly", width=23).pack(side="left", fill="x", expand=True)
-        self.scenario_button = ttk.Button(demo, text="Nạp tình huống", command=self.load_scenario)
-        self.scenario_button.pack(side="left", padx=(6, 0))
-        ttk.Label(address, text="Tình huống mẫu sẽ nạp lại bảng 3 segment ban đầu.",
-                  style="Sub.TLabel", wraplength=390).pack(anchor="w", pady=(5, 0))
-
-        result = ttk.Frame(right, padding=10, style="Card.TFrame")
-        result.pack(fill="x")
-        ttk.Label(result, text="Các bước dịch địa chỉ", style="Title.TLabel").pack(anchor="w")
-        self.pipeline_canvas = PipelineCanvas(result)
-        self.pipeline_canvas.pack(fill="x")
-        self.result_box = tk.Frame(result, background=COLORS["light_teal"], padx=10, pady=6)
-        self.result_box.pack(fill="x")
-        self.result_title = tk.Label(self.result_box, text="Sẵn sàng mô phỏng", anchor="w",
-            font=("Segoe UI", 12, "bold"), background=COLORS["light_teal"], foreground=COLORS["teal"])
-        self.result_title.pack(fill="x")
-        self.result_detail = tk.Label(self.result_box, text="Nhập địa chỉ logic và bấm Dịch địa chỉ.",
-            anchor="w", justify="left", wraplength=510, font=("Segoe UI", 10),
-            background=COLORS["light_teal"], foreground=COLORS["text"])
-        self.result_detail.pack(fill="x", pady=(4, 0))
-        self.result_box.bind("<Configure>", lambda e: self.result_detail.configure(wraplength=max(100, e.width - 24)))
-        trace_head = ttk.Frame(result)
-        trace_head.pack(fill="x", pady=(6, 4))
-        self.trace_label_var = tk.StringVar(value="Các bước xử lý")
-        ttk.Label(trace_head, textvariable=self.trace_label_var, style="Sub.TLabel").pack(side="left")
-        self.next_button = ttk.Button(trace_head, text="Bước tiếp →", command=self.next_step, state="disabled")
-        self.next_button.pack(side="right")
-        self.previous_button = ttk.Button(trace_head, text="← Lùi", command=self.previous_step, state="disabled")
-        self.previous_button.pack(side="right", padx=4)
-        self.restart_button = ttk.Button(trace_head, text="Chạy lại", command=self.restart_simulation, state="disabled")
-        self.restart_button.pack(side="right")
-        trace_frame = ttk.Frame(result)
-        trace_frame.pack(fill="x")
-        self.trace_text = tk.Text(trace_frame, height=2, wrap="word", relief="flat", padx=9, pady=4,
-            font=("Segoe UI", 10), background="#f5f8fb", foreground=COLORS["text"], state="disabled")
-        trace_scroll = ttk.Scrollbar(trace_frame, orient="vertical", command=self.trace_text.yview)
-        self.trace_text.configure(yscrollcommand=trace_scroll.set)
-        self.trace_text.pack(side="left", fill="both", expand=True)
-        trace_scroll.pack(side="right", fill="y")
-
-        map_card = ttk.Frame(right, padding=12, style="Card.TFrame")
-        map_card.pack(fill="both", expand=True, pady=(12, 0))
-        self.map_canvas = MemoryCanvas(map_card)
-        self.map_canvas.pack(fill="both", expand=True)
-
-    def _build_batch(self) -> None:
-        card = self._card(self.batch_tab, "Dịch danh sách địa chỉ từ CSV",
-            "Dùng một bản chụp bảng segment tại lúc chạy. Kết quả CSV được xuất đầy đủ.")
-        card.pack(fill="both", expand=True)
-        toolbar = ttk.Frame(card)
-        toolbar.pack(fill="x", pady=(0, 12))
-        self.batch_run_button = ttk.Button(toolbar, text="Mở addresses.csv và chạy",
-            style="Accent.TButton", command=self.open_addresses)
-        self.batch_run_button.pack(side="left")
-        self.batch_sample_button = ttk.Button(toolbar, text="Chạy bộ địa chỉ mẫu", command=self.run_sample_batch)
-        self.batch_sample_button.pack(side="left", padx=8)
-        self.export_button = ttk.Button(toolbar, text="Xuất kết quả CSV", command=self.export_results,
-                                        state="disabled")
-        self.export_button.pack(side="right")
-        self.progress = ttk.Progressbar(card, mode="indeterminate")
-        self.progress.pack(fill="x", pady=(0, 8))
-        self.batch_summary_var = tk.StringVar(value="Chưa chạy dữ liệu. Chọn CSV hoặc chạy bộ mẫu.")
-        ttk.Label(card, textvariable=self.batch_summary_var, wraplength=1000).pack(anchor="w", pady=(0, 10))
-        self.batch_tree = self._tree(card, ("row", "segment", "offset", "access", "status", "physical"),
-            ("Dòng", "Segment", "Offset", "Thao tác", "Kết quả", "Địa chỉ vật lý"),
-            (55, 100, 145, 85, 190, 180), 10)
-        self.batch_tree.tag_configure("ok", foreground=COLORS["teal"])
-        self.batch_tree.tag_configure("error", foreground=COLORS["red"])
-        self.batch_tree.bind("<<TreeviewSelect>>", self._select_batch_result)
-        ttk.Label(card, text=f"Hiển thị tối đa {DISPLAY_LIMIT:,} dòng đầu. Chọn một dòng để xem chi tiết bên dưới.",
-                  style="Sub.TLabel").pack(anchor="w", pady=(8, 5))
-        detail_frame = ttk.Frame(card)
-        detail_frame.pack(fill="x")
-        self.batch_detail = tk.Text(detail_frame, height=6, wrap="word", relief="flat", padx=12, pady=8,
-            font=("Segoe UI", 10), background="#f5f8fb", foreground=COLORS["text"], state="disabled")
-        scroll = ttk.Scrollbar(detail_frame, orient="vertical", command=self.batch_detail.yview)
-        self.batch_detail.configure(yscrollcommand=scroll.set)
-        self.batch_detail.pack(side="left", fill="x", expand=True)
-        scroll.pack(side="right", fill="y")
-        self.batch_map_button = ttk.Button(card, text="Xem dòng chọn trên sơ đồ →", command=self.show_batch_map,
-                                          state="disabled")
-        self.batch_map_button.pack(anchor="e", pady=(8, 0))
-
-    def _build_help(self) -> None:
-        card = self._card(self.help_tab, "Bắt đầu trong 3 phút", "Mô hình học tập về phân đoạn và dịch địa chỉ logic.")
-        card.pack(fill="both", expand=True)
-        body = tk.Text(card, wrap="word", relief="flat", font=("Segoe UI", 11),
-                       foreground=COLORS["text"], padx=8, pady=8)
-        scroll = ttk.Scrollbar(card, command=body.yview)
-        body.configure(yscrollcommand=scroll.set)
-        scroll.pack(side="right", fill="y")
-        body.pack(fill="both", expand=True)
-        text = """1. KHÁM PHÁ BẢNG SEGMENT
-Mỗi dòng gồm ID, base (địa chỉ bắt đầu), limit (độ dài) và quyền r/w/x.
-Chọn dòng rồi sang tab “Sửa bảng segment” để sửa thông số và bấm “Thêm / cập nhật”.
-ID có sẵn sẽ được cập nhật; ID mới sẽ được thêm.
-Nút “Nạp mẫu” đưa bảng về 3 segment ban đầu. Có thể nhập bảng từ CSV.
-
-2. DỊCH MỘT ĐỊA CHỈ
-Địa chỉ logic gồm (segment ID, offset). Chọn thao tác Đọc, Ghi hoặc Thực thi.
-Chương trình tra segment → kiểm tra 0 ≤ offset < limit → kiểm tra quyền → tính base + offset.
-“Dịch địa chỉ” hiển thị toàn bộ kết quả. “Từng bước” bắt đầu từ bước 0.
-Dùng “Bước tiếp →”, “← Lùi”, “Chạy lại” hoặc “Tự chạy / Tạm dừng” để điều khiển.
-Kết quả và dấu địa chỉ vật lý chỉ hiện sau bước cộng base + offset thành công.
-
-Với dữ liệu mẫu:
-• Segment 0, offset 120, Đọc → 1000 + 120 = 1120.
-• Segment 0, offset 399 → địa chỉ cuối cùng hợp lệ: 1399.
-• Segment 0, offset 400 → SEGMENTATION_FAULT (không có địa chỉ vật lý).
-• Segment 9, offset 10 → SEGMENT_NOT_FOUND.
-• Segment 0, offset 100, Ghi → PROTECTION_FAULT vì segment chỉ có quyền đọc và thực thi.
-
-3. CHẠY NHIỀU ĐỊA CHỈ
-Sang tab “Xử lý CSV”, mở addresses.csv hoặc bấm “Chạy bộ địa chỉ mẫu”.
-Chọn kết quả để xem trace; có thể đưa dòng chọn lên sơ đồ ở tab Dịch địa chỉ.
-Bảng lớn chỉ hiển thị 1.000 dòng đầu để giữ giao diện phản hồi. Xuất CSV vẫn gồm mọi kết quả.
-Bảng segment được chụp tại lúc chạy; sửa bảng sau đó không thay đổi kết quả cũ.
-
-ĐỊNH DẠNG CSV
-segments.csv: segment_id,base,limit,permissions
-Ví dụ: 0,1000,400,rw
-addresses.csv: segment_id,offset,access
-Ví dụ: 0,120,r
-Cột permissions và access là tùy chọn; mặc định lần lượt là rw và r.
-Thư mục input/ trong dự án có dữ liệu mẫu. CSV đầu vào dùng số nguyên hệ thập phân.
-
-HIỂU SƠ ĐỒ
-Các thanh được đặt theo địa chỉ vật lý và dùng cùng một thang từ 0 tới địa chỉ cuối cùng.
-Base là đầu thanh; địa chỉ cuối là base + limit − 1. Dấu màu chỉ địa chỉ truy cập hợp lệ.
-Vùng nhỏ hơn độ phân giải màn hình được vẽ rộng ít nhất 2 px để vẫn nhìn thấy.
-Tối đa 6 segment hiện trên sơ đồ; segment đang dịch luôn được đưa vào nếu tồn tại.
-Nhãn quá dài được rút gọn; CSV xuất và trace lưu giá trị đầy đủ.
-
-GIẢ ĐỊNH CỦA MÔ HÌNH
-Đây là trình mô phỏng, không đọc hoặc ghi bộ nhớ thật của máy.
-Quyền r/w/x là phần mở rộng để minh họa bảo vệ; truy cập bị từ chối không sinh địa chỉ vật lý.
-Một bảng đang xét cho một không gian địa chỉ, có ít nhất một segment và không có vùng chồng lấn.
-Không mô phỏng paging, swap hay kernel thật.
-Xem README và report/visualization.md để đọc thiết kế và kịch bản demo.
-"""
-        body.insert("1.0", text)
-        body.configure(state="disabled")
-
-    def _set_status(self, message: str) -> None:
-        self.status_var.set(message)
-
-    def _error(self, message: str) -> None:
-        self._set_status(message)
-        messagebox.showerror("Không thể thực hiện", message, parent=self.master)
-
-    def _replace_table(self, table: SegmentTable, source: str) -> None:
+    def set_state(self, table, playback):
         self.table = table
-        self.segment_tree.delete(*self.segment_tree.get_children())
-        for index, segment in enumerate(table.segments[:DISPLAY_LIMIT]):
-            self.segment_tree.insert("", "end", iid=str(index), values=(short_number(segment.segment_id),
-                short_number(segment.base), short_number(segment.limit), segment.permissions))
-        count = len(table.segments)
-        suffix = f" ({DISPLAY_LIMIT} hiện)" if count > DISPLAY_LIMIT else ""
-        self.segment_count_var.set(f"{count:,} segment{suffix}")
-        self.pause_play()
+        self.playback = playback
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.fillRect(self.rect(), QColor('white'))
+        painter.setFont(QFont('Segoe UI', 9))
+        width, height = self.width(), self.height()
+        if self.table is None:
+            painter.setPen(QColor(PALETTE['muted']))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter,
+                             'Thêm hoặc nhập bảng phân đoạn để xem Memory Map')
+            return
+        segments = list(self.table.segments[:6])
+        maximum = max(segment.base + segment.limit for segment in self.table.segments)
+        result = self.playback.result
+        looked_up = result is not None and self.playback.visible > 0
+        selected = next((segment for segment in self.table.segments
+                         if looked_up and segment.segment_id == result.segment_id), None)
+        if selected is not None and selected not in segments:
+            segments[-1] = selected
+        failed = bool(result and self.playback.complete and result.status != 'OK')
+        left, right = 76.0, float(max(width - 28, 130))
+        span = right - left
+        painter.setPen(QColor(PALETTE['text']))
+        painter.drawText(3, 17, 'BỘ NHỚ VẬT LÝ · thang địa chỉ chung')
+        painter.setPen(QPen(QColor(PALETTE['line']), 1))
+        painter.drawLine(int(left), 36, int(right), 36)
+        painter.setPen(QColor(PALETTE['muted']))
+        painter.drawText(int(left), 29, '0')
+        painter.drawText(QRectF(right - 110, 19, 110, 18), Qt.AlignmentFlag.AlignRight,
+                         compact(maximum - 1))
+        region_height = max(100, height - 115)
+        row_height = min(27, max(17, (region_height - 25) / max(len(segments), 1)))
+        for index, segment in enumerate(segments):
+            y = 47 + index * row_height
+            active = selected is segment
+            fill = PALETTE['error'] if active and failed else PALETTE['pass'] if active else '#b6cbdc'
+            x0 = min(right - 2, left + segment.base / maximum * span)
+            x1 = max(x0 + 2, left + (segment.base + segment.limit) / maximum * span)
+            painter.setPen(QColor(PALETTE['text']))
+            painter.drawText(2, int(y + 11), f'S{compact(segment.segment_id, 9)}')
+            painter.fillRect(QRectF(x0, y, max(2, x1 - x0), 12), QColor(fill))
+            if active and self.playback.physical_address is not None:
+                marker = left + self.playback.physical_address / maximum * span
+                painter.setPen(QPen(QColor(PALETTE['text']), 2))
+                painter.drawLine(int(marker), int(y - 4), int(marker), int(y + 17))
+        zoom_y = max(155, height - 88)
+        if selected is None:
+            message = 'Nhấn Từng bước để theo dõi segment và offset.'
+            if looked_up:
+                message = f'Không tìm thấy segment {result.segment_id}.'
+            painter.setPen(QColor(PALETTE['muted']))
+            painter.drawText(QRectF(5, zoom_y, width - 10, 50),
+                             Qt.AlignmentFlag.AlignCenter, message)
+        else:
+            painter.setPen(QColor(PALETTE['text']))
+            painter.drawText(3, zoom_y,
+                             f'PHÓNG TO S{compact(selected.segment_id)} · base {compact(selected.base)} · quyền {selected.permissions}')
+            bar_y = zoom_y + 10
+            painter.setPen(QPen(QColor(PALETTE['pass']), 1))
+            painter.setBrush(QColor(PALETTE['pass_bg']))
+            painter.drawRect(QRectF(left, bar_y, span, 16))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QColor(PALETTE['muted']))
+            painter.drawText(int(left), int(bar_y + 30), 'offset 0')
+            painter.drawText(QRectF(right - 150, bar_y + 17, 150, 18),
+                             Qt.AlignmentFlag.AlignRight,
+                             f'limit {compact(selected.limit)} (loại trừ)')
+            if result is not None and any(step.stage == 'bounds'
+                                          for step in result.steps[:self.playback.visible]):
+                ratio = max(0, min(1, result.offset / selected.limit))
+                marker = left + ratio * span
+                if result.offset < 0:
+                    marker -= 9
+                elif result.offset >= selected.limit:
+                    marker += 9
+                color = PALETTE['error'] if failed else PALETTE['active']
+                painter.setPen(QPen(QColor(color), 3))
+                painter.drawLine(int(marker), int(bar_y - 4), int(marker), int(bar_y + 20))
+                painter.setPen(QColor(color))
+                painter.drawText(3, int(bar_y + 49),
+                                 f'offset yêu cầu = {compact(result.offset)}' +
+                                 (' · ngoài đoạn' if not 0 <= result.offset < selected.limit else ''))
+        painter.end()
+
+
+class Dashboard(QWidget):
+    def __init__(self, parent_window):
+        super().__init__()
+        self.window = parent_window
+        grid = QGridLayout(self)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(13)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+        grid.setRowStretch(0, 1)
+        grid.setRowStretch(1, 1)
+        left, layout = card('▣  Bảng phân đoạn')
+        top = QHBoxLayout()
+        top.addStretch()
+        top.addWidget(button('＋ Thêm phân đoạn', self.window.add_segment, 'primary'))
+        layout.addLayout(top)
+        self.segment_table = data_table(['Segment', 'Base', 'Limit', 'Quyền'])
+        self.segment_table.setMinimumHeight(160)
+        layout.addWidget(self.segment_table, 1)
+        actions = QHBoxLayout()
+        actions.addWidget(button('✎  Sửa đã chọn', self.window.edit_segment))
+        actions.addWidget(button('Xóa đã chọn', self.window.delete_segment, 'danger'))
+        actions.addStretch()
+        layout.addLayout(actions)
+        grid.addWidget(left, 0, 0)
+
+        right, layout = card('⇄  Dịch địa chỉ logic')
+        fields = QGridLayout()
+        for col, name in enumerate(['Segment', 'Offset', 'Thao tác']):
+            fields.addWidget(QLabel(name), 0, col)
+        self.segment_input = QLineEdit()
+        self.segment_input.setPlaceholderText('Segment ID')
+        self.offset_input = QLineEdit()
+        self.offset_input.setPlaceholderText('Offset')
+        self.operation = QComboBox()
+        for label, access in [('Đọc (r)', 'r'), ('Ghi (w)', 'w'), ('Thực thi (x)', 'x')]:
+            self.operation.addItem(label, access)
+        fields.addWidget(self.segment_input, 1, 0)
+        fields.addWidget(self.offset_input, 1, 1)
+        fields.addWidget(self.operation, 1, 2)
+        layout.addLayout(fields)
+        commands = QHBoxLayout()
+        commands.addWidget(button('▶ Dịch địa chỉ', self.window.translate, 'primary'), 1)
+        commands.addWidget(button('☷ Từng bước', self.window.step_translate), 1)
+        layout.addLayout(commands)
+        self.result = QLabel('Chưa có kết quả. Hãy thêm phân đoạn và nhập địa chỉ logic.')
+        self.result.setObjectName('infoBox')
+        self.result.setWordWrap(True)
+        self.result.setMinimumHeight(44)
+        layout.addWidget(self.result)
+        self.steps = QLabel('Các bước kiểm tra sẽ hiển thị tại đây.')
+        self.steps.setObjectName('muted')
+        self.steps.setWordWrap(True)
+        layout.addWidget(self.steps)
+        self.pipeline = PipelineWidget()
+        layout.addWidget(self.pipeline)
+        playback_commands = QHBoxLayout()
+        playback_commands.addWidget(button('← Bước trước', self.window.previous_step))
+        playback_commands.addWidget(button('Bước tiếp →', self.window.next_step))
+        playback_commands.addWidget(button('↺ Chạy lại', self.window.restart_steps))
+        layout.addLayout(playback_commands)
+        grid.addWidget(right, 0, 1)
+
+        memory, layout = card('▦  Sơ đồ vùng nhớ (Memory Map)')
+        self.memory_map = MemoryMapWidget()
+        layout.addWidget(self.memory_map, 1)
+        grid.addWidget(memory, 1, 0)
+
+        history, layout = card('◷  Lịch sử dịch địa chỉ')
+        hrow = QHBoxLayout()
+        hrow.addStretch()
+        hrow.addWidget(button('Xem tất cả', lambda: self.window.show_page(1)))
+        layout.addLayout(hrow)
+        self.history_table = data_table(['Thời gian', 'Segment', 'Offset', 'Thao tác', 'Kết quả'])
+        self.history_table.setMinimumHeight(170)
+        layout.addWidget(self.history_table, 1)
+        grid.addWidget(history, 1, 1)
+
+        footer = QLabel('ⓘ Điều kiện: 0 ≤ Offset < Limit; thao tác phải nằm trong quyền truy cập của segment.')
+        footer.setObjectName('infoBox')
+        grid.addWidget(footer, 2, 0, 1, 2)
+
+    def set_segments(self, segments):
+        self.segment_table.setRowCount(len(segments))
+        for row, segment in enumerate(segments):
+            values = [segment.segment_id, segment.base, segment.limit,
+                      display_permissions(segment.permissions)]
+            for col, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.segment_table.setItem(row, col, item)
+
+    def set_result(self, text, success=None, details=''):
+        self.result.setText(text)
+        bg, fg = ('#e4f7ea', '#16683c') if success is True else (
+            ('#fde9eb', '#aa2939') if success is False else ('#edf4ff', '#5373a3')
+        )
+        self.result.setStyleSheet(f'background:{bg};color:{fg};padding:13px;border-radius:8px;')
+        self.steps.setText(details or 'Các bước kiểm tra sẽ hiển thị tại đây.')
+
+    def address(self):
+        return LogicalAddress(
+            segment_id=int(self.segment_input.text().strip()),
+            offset=int(self.offset_input.text().strip()),
+            access=self.operation.currentData()
+        )
+
+
+class HistoryPage(QWidget):
+    def __init__(self):
+        super().__init__()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        frame, inner = card('◷  Toàn bộ lịch sử dịch địa chỉ')
+        self.table = data_table(['Thời gian', 'Segment', 'Offset', 'Thao tác', 'Trạng thái', 'Địa chỉ vật lý'])
+        inner.addWidget(self.table)
+        layout.addWidget(frame)
+
+    def set_history(self, records):
+        self.table.setRowCount(len(records))
+        for row, (timestamp, result) in enumerate(records):
+            values = [timestamp, result.segment_id, result.offset, result.access,
+                      result.status, result.physical_address if result.physical_address is not None else '—']
+            for col, value in enumerate(values):
+                self.table.setItem(row, col, QTableWidgetItem(str(value)))
+
+
+class CSVPage(QWidget):
+    def __init__(self, parent_window):
+        super().__init__()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        frame, inner = card('▤  Nhập / Xuất CSV')
+        description = QLabel(
+            'Nhập bảng segment: segment_id,base,limit,permissions (permissions tùy chọn).\n'
+            'Nhập địa chỉ logic: segment_id,offset,access (access tùy chọn).\n'
+            'Các địa chỉ nhập vào sẽ được dịch bằng bảng segment hiện tại.'
+        )
+        description.setWordWrap(True)
+        inner.addWidget(description)
+        controls = QHBoxLayout()
+        controls.addWidget(button('Nhập bảng Segment', parent_window.import_segments, 'primary'))
+        controls.addWidget(button('Nhập địa chỉ CSV', parent_window.import_addresses))
+        controls.addWidget(button('Xuất kết quả CSV', parent_window.export_results))
+        inner.addLayout(controls)
+        self.status = QLabel('Chưa nhập hoặc xuất tệp CSV.')
+        self.status.setObjectName('infoBox')
+        self.status.setWordWrap(True)
+        inner.addWidget(self.status)
+        samples = QLabel(
+            'Ví dụ bảng segment:\nsegment_id,base,limit,permissions\n0,1000,200,rw\n1,3000,500,rx\n\n'
+            'Ví dụ địa chỉ:\nsegment_id,offset,access\n0,25,r\n1,50,x'
+        )
+        samples.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        inner.addWidget(samples)
+        inner.addStretch()
+        layout.addWidget(frame)
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.segments = []
+        self.segment_table = None
+        self.results = []
+        self.history = []
+        self.playback = Playback()
+        self.logged_current = False
+        self.setWindowTitle('Segmentation Simulator | Mô phỏng địa chỉ logic')
+        self.resize(1420, 870)
+        self.setMinimumSize(1000, 650)
+        self.setStyleSheet(STYLE)
+        root = QWidget()
+        root.setObjectName('root')
+        self.setCentralWidget(root)
+        outer = QHBoxLayout(root)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        sidebar = QFrame()
+        sidebar.setObjectName('sidebar')
+        sidebar.setFixedWidth(220)
+        sidebar_layout = QVBoxLayout(sidebar)
+        sidebar_layout.setContentsMargins(15, 25, 15, 18)
+        sidebar_layout.setSpacing(10)
+        brand = QLabel('▣  Segmentation\n     Simulator')
+        brand.setObjectName('brand')
+        sidebar_layout.addWidget(brand)
+        sidebar_layout.addSpacing(27)
+        self.nav = []
+        for index, label in enumerate(['⌂  Trang chủ', '◷  Lịch sử', '▤  Nhập / Xuất CSV', 'ⓘ  Hướng dẫn']):
+            nav_button = QPushButton(label)
+            nav_button.setObjectName('nav')
+            nav_button.clicked.connect(lambda checked=False, i=index: self.show_page(i))
+            sidebar_layout.addWidget(nav_button)
+            self.nav.append(nav_button)
+        sidebar_layout.addStretch()
+        info = QLabel('Mô phỏng phân đoạn bộ nhớ\nvà chuyển đổi địa chỉ logic\nsang địa chỉ vật lý.')
+        info.setObjectName('sideInfo')
+        info.setWordWrap(True)
+        sidebar_layout.addWidget(info)
+        outer.addWidget(sidebar)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        outer.addWidget(scroll, 1)
+        content = QWidget()
+        scroll.setWidget(content)
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(22, 25, 22, 23)
+        content_layout.setSpacing(15)
+        heading_row = QHBoxLayout()
+        titles = QVBoxLayout()
+        title = QLabel('Mô phỏng Segmentation và Địa chỉ Logic')
+        title.setObjectName('title')
+        titles.addWidget(title)
+        subtitle = QLabel('Quản lý segment, kiểm tra giới hạn, quyền truy cập và dịch địa chỉ.')
+        subtitle.setObjectName('muted')
+        titles.addWidget(subtitle)
+        heading_row.addLayout(titles, 1)
+        heading_row.addWidget(button('↻ Đặt lại', self.reset, 'secondary'))
+        content_layout.addLayout(heading_row)
+        self.pages = QStackedWidget()
+        self.dashboard = Dashboard(self)
+        self.history_page = HistoryPage()
+        self.csv_page = CSVPage(self)
+        self.pages.addWidget(self.dashboard)
+        self.pages.addWidget(self.history_page)
+        self.pages.addWidget(self.csv_page)
+        self.pages.addWidget(self.build_help_page())
+        content_layout.addWidget(self.pages, 1)
+        self.show_page(0)
+        self.refresh_segments()
+        self.refresh_playback()
+
+    def build_help_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        frame, inner = card('ⓘ  Hướng dẫn sử dụng')
+        text = QLabel(
+            '1. Nhấn Thêm phân đoạn để nhập Segment ID, Base, Limit và quyền truy cập.\n'
+            '2. Nhập Segment, Offset và thao tác Đọc/Ghi/Thực thi.\n'
+            '3. Nhấn Dịch địa chỉ để xem kết quả ngay lập tức.\n'
+            '4. Nhấn Từng bước, sau đó dùng Bước tiếp / Bước trước để theo dõi mô phỏng.\n'
+            '5. Theo dõi sơ đồ vùng nhớ và xem các kết quả đã dịch trong Lịch sử.\n'
+            '6. Trang Nhập / Xuất CSV hỗ trợ đọc bảng segment, chạy nhiều địa chỉ và xuất kết quả.\n\n'
+            'Quy tắc: 0 ≤ offset < limit, quyền truy cập phải được cấp, địa chỉ vật lý = base + offset.\n'
+            'Bảng segment không cho phép ID trùng hoặc các khoảng vật lý chồng lấn.'
+        )
+        text.setWordWrap(True)
+        inner.addWidget(text)
+        inner.addStretch()
+        layout.addWidget(frame)
+        return page
+
+    def show_page(self, index):
+        self.pages.setCurrentIndex(index)
+        for i, widget in enumerate(self.nav):
+            widget.setProperty('active', 'true' if i == index else 'false')
+            widget.style().unpolish(widget)
+            widget.style().polish(widget)
+
+    def selected_segment(self):
+        index = self.dashboard.segment_table.currentRow()
+        if not 0 <= index < len(self.segments):
+            QMessageBox.information(self, 'Chọn phân đoạn', 'Hãy chọn một phân đoạn trong bảng trước.')
+            return None
+        return self.segments[index]
+
+    def validate_segments(self, entries):
+        return SegmentTable(entries) if entries else None
+
+    def replace_segments(self, entries):
+        table = self.validate_segments(entries)
+        self.segments = list(entries)
+        self.segment_table = table
         self.playback.clear()
-        self._map_table = table
-        self.single_result = None
-        self.trace_steps = ()
-        self.trace_visible = 0
-        self._show_trace()
-        self._set_banner("Bảng segment đã sẵn sàng", "Nhập địa chỉ logic để bắt đầu phép dịch.")
-        self._draw_map(table, None)
-        self._set_status(f"{source} · {count:,} segment.")
+        self.logged_current = False
+        self.refresh_segments()
+        self.refresh_playback()
 
-    def load_sample(self) -> None:
-        self.load_segments_path(PROJECT_ROOT / "input" / "segments.csv")
+    def refresh_segments(self):
+        self.dashboard.set_segments(self.segments)
+        self.dashboard.memory_map.set_state(self.segment_table, self.playback)
 
-    def open_segments(self) -> None:
-        path = filedialog.askopenfilename(parent=self.master, title="Mở bảng segment",
-            initialdir=str(PROJECT_ROOT / "input"), filetypes=[("CSV", "*.csv"), ("Tất cả", "*.*")])
-        if path:
-            self.load_segments_path(path)
-
-    def load_segments_path(self, path: str | Path) -> bool:
-        """Parse and validate before mutating the visible table."""
-        try:
-            new_table = SegmentTable(load_segments(path))
-        except (ValueError, OSError, UnicodeError) as exc:
-            self._error(str(exc))
-            return False
-        self._replace_table(new_table, f"Đã mở {Path(path).name}")
-        return True
-
-    def _select_segment(self, event=None) -> None:
-        selection = self.segment_tree.selection()
-        if not selection:
+    def add_segment(self):
+        dialog = SegmentDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        segment = self.table.segments[int(selection[0])]
-        self.segment_id_var.set(str(segment.segment_id))
-        self.base_var.set(str(segment.base))
-        self.limit_var.set(str(segment.limit))
-        self.permissions_var.set(segment.permissions)
-        self.address_segment_var.set(str(segment.segment_id))
-
-    def upsert_segment(self) -> None:
         try:
-            segment = Segment(int(self.segment_id_var.get()), int(self.base_var.get()),
-                              int(self.limit_var.get()), self.permissions_var.get())
-            candidates = list(self.table.segments)
-            matching = next((i for i, existing in enumerate(candidates)
-                             if existing.segment_id == segment.segment_id), None)
-            if matching is None:
-                candidates.append(segment)
-            else:
-                candidates[matching] = segment
-            table = SegmentTable(candidates)
+            segment = dialog.get_segment()
+            self.replace_segments([*self.segments, segment])
         except (ValueError, TypeError) as exc:
-            self._error(f"Dữ liệu segment không hợp lệ: {exc}")
-            return
-        self._replace_table(table, f"Đã lưu segment {short_number(segment.segment_id)}")
+            QMessageBox.warning(self, 'Không thể thêm phân đoạn', str(exc))
 
-    def remove_segment(self) -> None:
-        selection = self.segment_tree.selection()
-        if not selection:
-            self._set_status("Chọn một dòng trong bảng segment để xóa.")
+    def edit_segment(self):
+        selected = self.selected_segment()
+        if selected is None:
             return
-        if len(self.table.segments) == 1:
-            self._error("Bảng phải có ít nhất một segment. Hãy thêm segment khác trước khi xóa.")
+        dialog = SegmentDialog(self, selected)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        index = int(selection[0])
-        removed = self.table.segments[index]
-        segments = [segment for i, segment in enumerate(self.table.segments) if i != index]
-        self._replace_table(SegmentTable(segments), f"Đã xóa segment {short_number(removed.segment_id)}")
-
-    def translate_single(self, step: bool = False) -> None:
         try:
-            address = LogicalAddress(int(self.address_segment_var.get()), int(self.offset_var.get()),
-                                     ACCESS_NAMES[self.access_var.get()])
-            result = self.table.translate(address)
-        except (ValueError, TypeError, KeyError) as exc:
-            self._error(f"Địa chỉ nhập không hợp lệ: {exc}")
+            updated = dialog.get_segment()
+            entries = [updated if segment.segment_id == selected.segment_id else segment
+                       for segment in self.segments]
+            self.replace_segments(entries)
+        except (ValueError, TypeError) as exc:
+            QMessageBox.warning(self, 'Không thể sửa phân đoạn', str(exc))
+
+    def delete_segment(self):
+        selected = self.selected_segment()
+        if selected is None:
             return
-        self.single_result = result
-        self._present_result(result, self.table, step=step)
-        if step:
-            self._set_status("Đã nạp yêu cầu. Bấm Bước tiếp hoặc Tự chạy để bắt đầu kiểm tra.")
-        else:
-            self._set_status(f"Đã dịch ({short_number(result.segment_id)}, {short_number(result.offset)}) · {result.status}.")
+        answer = QMessageBox.question(self, 'Xác nhận xóa',
+                                      f'Xóa Segment {selected.segment_id}?',
+                                      QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if answer == QMessageBox.StandardButton.Yes:
+            self.replace_segments([segment for segment in self.segments
+                                   if segment.segment_id != selected.segment_id])
 
-    def _set_banner(self, title: str, detail: str, error: bool = False) -> None:
-        background = COLORS["light_red"] if error else COLORS["light_teal"]
-        foreground = COLORS["red"] if error else COLORS["teal"]
-        self.result_box.configure(background=background)
-        self.result_title.configure(text=title, background=background, foreground=foreground)
-        self.result_detail.configure(text=detail, background=background)
+    def compute(self, complete):
+        if self.segment_table is None:
+            QMessageBox.warning(self, 'Chưa có bảng segment', 'Hãy thêm hoặc nhập ít nhất một segment.')
+            return
+        try:
+            address = self.dashboard.address()
+            result = self.segment_table.translate(address)
+        except (ValueError, TypeError) as exc:
+            QMessageBox.warning(self, 'Địa chỉ không hợp lệ', str(exc))
+            return
+        self.playback.load(result, complete=complete)
+        self.logged_current = False
+        self.refresh_playback()
 
+    def translate(self):
+        self.compute(True)
 
-    def _present_result(self, result: TranslationResult, table: SegmentTable, step: bool = False) -> None:
-        self.pause_play()
-        self.playback.load(result, complete=not step)
-        self._map_table = table
-        self._refresh_simulation()
+    def step_translate(self):
+        self.compute(False)
 
-    def _refresh_simulation(self) -> None:
-        state, result = self.playback, self.playback.result
-        self.pipeline_canvas.draw(state)
-        self.map_canvas.draw(self._map_table, state)
-        self._map_result = result
-        self.trace_steps = tuple(s.description for s in result.steps) if result else ()
-        self.trace_visible = state.visible
-        lines = [f"{i + 1}. {s.title}: {s.description}" for i, s in
-                 enumerate(result.steps[:state.visible])] if result else []
-        self._write_text(self.trace_text, "\n".join(lines))
-        self.trace_text.see("end")
-        self.trace_label_var.set(f"Đã chạy {state.visible}/{state.total} bước")
-        self.next_button.configure(state="normal" if result and not state.complete else "disabled")
-        self.previous_button.configure(state="normal" if state.visible else "disabled")
-        self.restart_button.configure(state="normal" if result else "disabled")
-        if result is None:
-            self._set_banner("Sẵn sàng mô phỏng", "Nhập địa chỉ hoặc nạp một tình huống mẫu.")
-        elif not state.complete:
-            detail = result.steps[state.visible - 1].description if state.visible else (
-                f"Yêu cầu ({compact(result.segment_id)}, {compact(result.offset)}) · truy cập {result.access}."
-                " Bấm Bước tiếp hoặc Tự chạy.")
-            self._set_banner(f"Đang mô phỏng · {state.visible}/{state.total} bước", detail)
-        elif result.status == "OK":
-            self._set_banner(f"Địa chỉ vật lý: {compact(state.physical_address)}",
-                f"{compact(result.base)} + {compact(result.offset)} = {compact(state.physical_address)}"
-                f" · quyền {result.access} được phép.")
-        else:
-            self._set_banner(result.status, result.message, error=True)
-        if result is not None:
-            self._set_status(f"Hoàn tất · {result.status}." if state.complete else
-                f"Đang mô phỏng ({compact(result.segment_id)}, {compact(result.offset)}) · "
-                f"đã chạy {state.visible}/{state.total} bước.")
-
-    @staticmethod
-    def _write_text(widget: tk.Text, text: str) -> None:
-        widget.configure(state="normal")
-        widget.delete("1.0", "end")
-        widget.insert("1.0", text)
-        widget.configure(state="disabled")
-
-    def _show_trace(self) -> None:
-        self._refresh_simulation()
-
-    def next_step(self) -> None:
-        self.pause_play()
+    def next_step(self):
         self.playback.forward()
-        self._refresh_simulation()
+        self.refresh_playback()
 
-    def previous_step(self) -> None:
-        self.pause_play()
+    def previous_step(self):
         self.playback.backward()
-        self._refresh_simulation()
+        self.refresh_playback()
 
-    def restart_simulation(self) -> None:
-        self.pause_play()
+    def restart_steps(self):
         self.playback.restart()
-        self._refresh_simulation()
+        self.refresh_playback()
 
-    def pause_play(self) -> None:
-        if self._play_after is not None:
-            self.after_cancel(self._play_after)
-            self._play_after = None
-        self.play_button.configure(text="▶ Tự chạy")
-
-    def toggle_play(self) -> None:
-        if self._play_after is not None:
-            self.pause_play()
+    def refresh_playback(self):
+        playback = self.playback
+        self.dashboard.pipeline.set_playback(playback)
+        self.dashboard.memory_map.set_state(self.segment_table, playback)
+        if playback.result is None:
+            self.dashboard.set_result('Chưa có kết quả. Hãy nhập địa chỉ logic để bắt đầu.')
             return
-        if self.playback.result is None:
-            self.translate_single(step=True)
-            if self.playback.result is None:
-                return
-        elif self.playback.complete:
-            self.playback.restart()
-            self._refresh_simulation()
-        self.play_button.configure(text="Ⅱ Tạm dừng")
-        self._play_after = self.after(self._play_delay(), self._auto_tick)
-
-    def _play_delay(self) -> int:
-        return {"0,5 giây": 500, "1 giây": 1000, "2 giây": 2000}.get(self.speed_var.get(), 1000)
-
-    def _auto_tick(self) -> None:
-        self._play_after = None
-        self.playback.forward()
-        self._refresh_simulation()
-        if self.playback.complete:
-            self.pause_play()
+        current = playback.result
+        revealed = current.steps[:playback.visible]
+        details = '\n'.join(f'{i + 1}. {step.title}: {step.description}'
+                            for i, step in enumerate(revealed))
+        if playback.complete:
+            if current.status == 'OK':
+                message = (f'✓ Dịch thành công: Segment {current.segment_id}, offset {current.offset} '
+                           f'→ địa chỉ vật lý {current.physical_address} '
+                           f'(base {current.base} + {current.offset}).')
+            else:
+                message = f'✕ {current.status}: {current.message}'
+            self.dashboard.set_result(message, current.status == 'OK', details)
+            if not self.logged_current:
+                self.record_result(current)
+                self.logged_current = True
         else:
-            self._play_after = self.after(self._play_delay(), self._auto_tick)
+            self.dashboard.set_result(f'Đang mô phỏng: bước {playback.visible}/{playback.total}. '
+                                      'Kết quả cuối sẽ xuất hiện sau bước cuối.', None, details)
 
-    def load_scenario(self) -> None:
-        self.pause_play()
-        segment_id, offset, access = self.scenarios[self.scenario_var.get()]
-        if not self.load_segments_path(PROJECT_ROOT / "input" / "segments.csv"):
+    def record_result(self, result):
+        timestamp = datetime.now().strftime('%d/%m/%Y %H:%M:%S')
+        self.history.append((timestamp, result))
+        self.results.append(result)
+        self.refresh_history()
+
+    def refresh_history(self):
+        self.history_page.set_history(self.history)
+        records = self.history[-30:]
+        table = self.dashboard.history_table
+        table.setRowCount(len(records))
+        for row, (timestamp, result) in enumerate(reversed(records)):
+            values = [timestamp, result.segment_id, result.offset, result.access,
+                      result.physical_address if result.status == 'OK' else result.status]
+            for col, value in enumerate(values):
+                table.setItem(row, col, QTableWidgetItem(str(value)))
+
+    def import_segments(self):
+        path, _ = QFileDialog.getOpenFileName(self, 'Nhập bảng segment CSV', '', 'CSV (*.csv)')
+        if not path:
             return
-        self.address_segment_var.set(str(segment_id))
-        self.offset_var.set(str(offset))
-        self.access_var.set(access)
-        self.translate_single(step=True)
-        self._set_status(f"Đã nạp tình huống: {self.scenario_var.get()}. Bấm Bước tiếp hoặc Tự chạy.")
-
-    def _draw_map(self, table: SegmentTable, result: TranslationResult | None) -> None:
-        self._map_table, self._map_result = table, result
-        self.map_canvas.draw(table, self.playback)
-
-    def _start_job(self, operation: Callable, callback: Callable, status: str) -> None:
-        if self._job_running:
-            self._set_status("Đang xử lý dữ liệu; vui lòng đợi tác vụ hiện tại hoàn tất.")
-            return
-        self._job_running = True
-        self._job_callback = callback
-        for button in (self.batch_run_button, self.batch_sample_button, self.export_button):
-            button.configure(state="disabled")
-        self.progress.start(12)
-        self._set_status(status)
-
-        def run() -> None:
-            try:
-                self._job_queue.put((True, operation()))
-            except Exception as exc:  # Exceptions cross the thread boundary as data.
-                self._job_queue.put((False, exc))
-
-        threading.Thread(target=run, daemon=True, name="segmentation-csv-worker").start()
-        self._job_after = self.after(50, self._poll_job)
-
-    def _poll_job(self) -> None:
-        self._job_after = None
         try:
-            success, payload = self._job_queue.get_nowait()
-        except queue.Empty:
-            self._job_after = self.after(50, self._poll_job)
+            entries = load_segments(path)
+            self.replace_segments(entries)
+        except (ValueError, OSError) as exc:
+            QMessageBox.warning(self, 'Lỗi nhập bảng segment', str(exc))
             return
-        callback = self._job_callback
-        self._job_running = False
-        self._job_callback = None
-        self.progress.stop()
-        self.batch_run_button.configure(state="normal")
-        self.batch_sample_button.configure(state="normal")
-        self.export_button.configure(state="normal" if self.batch_results else "disabled")
-        if success:
-            callback(payload)
-        else:
-            self._error(f"Không thể xử lý CSV: {payload}")
+        self.csv_page.status.setText(f'✓ Đã nạp {len(entries)} segment từ {Path(path).name}.')
 
-    def open_addresses(self) -> None:
-        path = filedialog.askopenfilename(parent=self.master, title="Mở danh sách địa chỉ logic",
-            initialdir=str(PROJECT_ROOT / "input"), filetypes=[("CSV", "*.csv"), ("Tất cả", "*.*")])
-        if path:
-            self.run_batch_path(path)
-
-    def run_batch_path(self, path: str | Path) -> None:
-        snapshot = self.table
-        def process():
+    def import_addresses(self):
+        if self.segment_table is None:
+            QMessageBox.warning(self, 'Chưa có bảng segment', 'Hãy thêm hoặc nhập segment trước.')
+            return
+        path, _ = QFileDialog.getOpenFileName(self, 'Nhập danh sách địa chỉ CSV', '', 'CSV (*.csv)')
+        if not path:
+            return
+        try:
             addresses = load_addresses(path)
-            return (list(snapshot.translate_many(addresses)), snapshot, Path(path).name)
-        self._start_job(process, self._accept_batch, "Đang đọc CSV và dịch địa chỉ…")
-
-    def run_sample_batch(self) -> None:
-        self.run_batch_path(PROJECT_ROOT / "input" / "addresses.csv")
-
-    def _accept_batch(self, payload) -> None:
-        results, table, source = payload
-        self.batch_results, self.batch_table = results, table
-        self.batch_tree.delete(*self.batch_tree.get_children())
-        for index, result in enumerate(results[:DISPLAY_LIMIT]):
-            self.batch_tree.insert("", "end", iid=str(index), values=(index + 1,
-                short_number(result.segment_id), short_number(result.offset), result.access,
-                STATUS_NAMES.get(result.status, result.status), short_number(result.physical_address)),
-                tags=("ok" if result.status == "OK" else "error",))
-        ok_count = sum(result.status == "OK" for result in results)
-        self.batch_summary_var.set(f"{source}  ·  {len(results):,} địa chỉ  ·  {ok_count:,} hợp lệ"
-            f"  ·  {len(results) - ok_count:,} bị từ chối  ·  bảng chụp: {len(table.segments):,} segment")
-        self._write_text(self.batch_detail, "Chọn một dòng để xem thông tin và các bước xử lý.")
-        self.export_button.configure(state="normal" if results else "disabled")
-        self.batch_map_button.configure(state="disabled")
-        self._set_status(f"Đã xử lý {len(results):,} địa chỉ. Có thể xuất toàn bộ kết quả CSV.")
+            results = self.segment_table.translate_many(addresses)
+        except (ValueError, OSError) as exc:
+            QMessageBox.warning(self, 'Lỗi nhập địa chỉ', str(exc))
+            return
+        for result in results:
+            self.record_result(result)
         if results:
-            self.batch_tree.selection_set("0")
-            self._select_batch_result()
+            self.playback.load(results[-1], complete=True)
+            self.logged_current = True
+            self.refresh_playback()
+        successes = sum(result.status == 'OK' for result in results)
+        self.csv_page.status.setText(
+            f'✓ Đã dịch {len(results)} địa chỉ từ {Path(path).name}: '
+            f'{successes} thành công, {len(results) - successes} lỗi. '
+            'Kết quả đã thêm vào lịch sử và sẵn sàng để xuất CSV.'
+        )
 
-    def _select_batch_result(self, event=None) -> None:
-        selection = self.batch_tree.selection()
-        if not selection:
+    def export_results(self):
+        if not self.results:
+            QMessageBox.information(self, 'Chưa có kết quả', 'Hãy dịch ít nhất một địa chỉ trước khi xuất CSV.')
             return
-        result = self.batch_results[int(selection[0])]
-        lines = [f"Trạng thái: {result.status} · Segment {result.segment_id} · Offset {result.offset} · Thao tác {result.access}",
-                 f"Địa chỉ vật lý: {result.physical_address if result.physical_address is not None else 'Không có'}", result.message]
-        lines.extend(result.trace)
-        self._write_text(self.batch_detail, "\n".join(lines))
-        self.batch_map_button.configure(state="normal")
-
-    def show_batch_map(self) -> None:
-        selection = self.batch_tree.selection()
-        if not selection:
+        path, _ = QFileDialog.getSaveFileName(self, 'Xuất kết quả CSV', 'ket_qua_dich_dia_chi.csv', 'CSV (*.csv)')
+        if not path:
             return
-        result = self.batch_results[int(selection[0])]
-        self._present_result(result, self.batch_table)
-        self.notebook.select(self.simulator_tab)
-        self._set_status("Đang xem kết quả CSV trên bảng segment đã chụp lúc chạy; bảng chỉnh sửa bên trái có thể khác.")
-
-    def export_results(self) -> None:
-        if not self.batch_results:
-            self._set_status("Chạy danh sách địa chỉ trước khi xuất kết quả.")
+        try:
+            save_results(path, self.results)
+        except (ValueError, OSError) as exc:
+            QMessageBox.warning(self, 'Lỗi xuất CSV', str(exc))
             return
-        path = filedialog.asksaveasfilename(parent=self.master, title="Xuất toàn bộ kết quả",
-            initialdir=str(PROJECT_ROOT / "output"), initialfile="translation_results.csv",
-            defaultextension=".csv", filetypes=[("CSV", "*.csv")])
-        if path:
-            results = self.batch_results
-            self._start_job(lambda: save_results(path, results),
-                lambda _: self._set_status(f"Đã xuất {len(results):,} kết quả tới {path}"), "Đang xuất kết quả CSV…")
+        self.csv_page.status.setText(f'✓ Đã xuất {len(self.results)} kết quả tới {Path(path).name}.')
+
+    def reset(self):
+        answer = QMessageBox.question(
+            self, 'Đặt lại toàn bộ',
+            'Xóa tất cả segment, kết quả và lịch sử dịch địa chỉ?',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.segments = []
+        self.segment_table = None
+        self.results.clear()
+        self.history.clear()
+        self.logged_current = False
+        self.playback.clear()
+        self.dashboard.segment_input.clear()
+        self.dashboard.offset_input.clear()
+        self.dashboard.operation.setCurrentIndex(0)
+        self.refresh_segments()
+        self.refresh_playback()
+        self.refresh_history()
+        self.csv_page.status.setText('Đã đặt lại dữ liệu mô phỏng.')
+        self.show_page(0)
 
 
-def main() -> None:
-    root = tk.Tk()
-    SegmentationApp(root)
-    root.mainloop()
-
-
-if __name__ == "__main__":
-    main()
+def main():
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication(sys.argv)
+    app.setStyle('Fusion')
+    window = MainWindow()
+    window.show()
+    return app.exec()
